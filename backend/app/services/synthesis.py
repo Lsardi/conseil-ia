@@ -15,6 +15,19 @@ logger = get_logger("services.synthesis")
 class SynthesisService:
     """Synthétise les réponses de plusieurs modèles IA."""
 
+    @staticmethod
+    def _filter_valid_results(
+        results: dict[str, ModelResult]
+    ) -> dict[str, ModelResult]:
+        return {name: r for name, r in results.items() if r.content and not r.error}
+
+    @staticmethod
+    def _summarize(content: str, limit: int = 500) -> str:
+        summary = content[:limit]
+        if len(content) > limit:
+            summary += "..."
+        return summary
+
     async def synthesize(
         self,
         question: str,
@@ -29,9 +42,7 @@ class SynthesisService:
         Returns:
             Texte de synthèse.
         """
-        valid_results = {
-            name: r for name, r in results.items() if r.content and not r.error
-        }
+        valid_results = self._filter_valid_results(results)
 
         if not valid_results:
             logger.warning("Aucune réponse valide pour la synthèse")
@@ -53,10 +64,9 @@ class SynthesisService:
         parts.append("### Points clés par modèle\n")
         for name, result in valid_results.items():
             # Extraire un résumé (premiers 500 caractères)
-            summary = result.content[:500]
-            if len(result.content) > 500:
-                summary += "..."
-            parts.append(f"**{name}:** {summary}\n")
+            parts.append(
+                f"**{name}:** {self._summarize(result.content)}\n"
+            )
 
         # Consensus
         consensus = self.calculate_consensus(valid_results)
@@ -103,9 +113,7 @@ class SynthesisService:
         Returns:
             Texte du débat formaté.
         """
-        valid_results = {
-            name: r for name, r in results.items() if r.content and not r.error
-        }
+        valid_results = self._filter_valid_results(results)
 
         if not valid_results:
             return "Aucun modèle n'a pu participer au débat."
