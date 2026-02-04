@@ -32,7 +32,7 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = self._get_client_ip(request)
         now = time.time()
 
         # Nettoyer les anciennes entrées
@@ -66,3 +66,12 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
 
         self._requests[client_ip].append(now)
         return await call_next(request)
+
+    @staticmethod
+    def _get_client_ip(request: Request) -> str:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+        if request.client:
+            return request.client.host
+        return "unknown"

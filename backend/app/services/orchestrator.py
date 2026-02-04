@@ -79,24 +79,7 @@ class Orchestrator:
             for name, adapter in self._adapters.items()
         }
 
-    async def ask(self, request: CouncilRequest) -> CouncilResponse:
-        """Traite une requête du conseil.
-
-        1. Vérifie le cache
-        2. Optimise les prompts
-        3. Interroge les modèles en parallèle
-        4. Synthétise les réponses
-        5. Met en cache le résultat
-
-        Args:
-            request: La requête du conseil.
-
-        Returns:
-            La réponse complète du conseil.
-        """
-        request_id = str(uuid.uuid4())[:8]
-        start_time = time.perf_counter()
-
+    def _log_request(self, request_id: str, request: CouncilRequest) -> None:
         logger.info(
             "Nouvelle requête [%s]",
             request_id,
@@ -111,52 +94,42 @@ class Orchestrator:
             },
         )
 
-        model_names = [m.value for m in request.models]
-
-        # 1. Vérifier le cache
+    async def _get_cached_response(
+        self, request_id: str, request: CouncilRequest, model_names: list[str]
+    ) -> CouncilResponse | None:
         cached = await self._cache.get(
             request.question, model_names, request.mode.value
         )
-        if cached:
-            logger.info(
-                "Réponse servie depuis le cache [%s]",
-                request_id,
-                extra={"extra_data": {"request_id": request_id, "cached": True}},
-            )
-            response = CouncilResponse(**cached)
-            response.cached = True
-            response.request_id = request_id
-            return response
+        if not cached:
+            return None
 
-        # 2. Filtrer les modèles configurés
-        active_models = [
+        logger.info(
+            "Réponse servie depuis le cache [%s]",
+            request_id,
+            extra={"extra_data": {"request_id": request_id, "cached": True}},
+        )
+        response = CouncilResponse(**cached)
+        response.cached = True
+        response.request_id = request_id
+        return response
+
+    def _get_active_models(self, model_names: list[str]) -> list[str]:
+        return [
             name
             for name in model_names
             if name in self._adapters and self._adapters[name].is_configured()
         ]
 
-        if not active_models:
-            logger.error(
-                "Aucun modèle configuré parmi %s [%s]",
-                model_names,
-                request_id,
-            )
-            return CouncilResponse(
-                synthesis="Erreur: aucun modèle configuré. Vérifiez vos clés API.",
-                request_id=request_id,
-                mode=request.mode,
-            )
-
-        logger.info(
-            "Modèles actifs pour cette requête [%s]: %s",
-            request_id,
-            active_models,
-        )
-
-        # 3. Optimiser les prompts
+    def _build_prompts(
+        self, request: CouncilRequest, active_models: list[str]
+    ) -> dict[str, str]:
         prompts: dict[str, str] = {}
+        use_optimization = (
+            self._settings.prompt_optimization_enabled
+            and request.optimize_prompts
+        )
         for model_name in active_models:
-            if request.optimize_prompts and model_name in PROMPT_TEMPLATES:
+            if use_optimization and model_name in PROMPT_TEMPLATES:
                 template = PROMPT_TEMPLATES[model_name]
                 prompts[model_name] = (
                     f"{template['prefix']}\n\n"
@@ -165,20 +138,21 @@ class Orchestrator:
                 )
             else:
                 prompts[model_name] = request.question
+        return prompts
 
-        # 4. Interroger en parallèle
-        logger.debug(
-            "Lancement des appels parallèles [%s]",
-            request_id,
-        )
-
+    async def _run_models(
+        self,
+        request_id: str,
+        prompts: dict[str, str],
+        request: CouncilRequest,
+    ) -> dict[str, ModelResult]:
         tasks = {
             model_name: self._adapters[model_name].safe_generate(
                 prompts[model_name],
                 temperature=request.temperature,
                 max_tokens=request.max_tokens or self._settings.max_tokens,
             )
-            for model_name in active_models
+            for model_name in prompts
         }
 
         results: dict[str, ModelResult] = {}
@@ -202,25 +176,37 @@ class Orchestrator:
             else:
                 results[model_name] = result
 
-        # 5. Synthétiser
-        synthesis_text = None
-        consensus_score = None
+        return results
 
+    async def _build_synthesis(
+        self,
+        request: CouncilRequest,
+        results: dict[str, ModelResult],
+    ) -> tuple[str | None, float | None]:
         if request.mode == ResponseMode.SYNTHESIS:
             synthesis_text = await self._synthesis.synthesize(
                 request.question, results
             )
             consensus_score = self._synthesis.calculate_consensus(results)
-        elif request.mode == ResponseMode.DEBATE:
+            return synthesis_text, consensus_score
+        if request.mode == ResponseMode.DEBATE:
             synthesis_text = await self._synthesis.create_debate(
                 request.question, results
             )
             consensus_score = self._synthesis.calculate_consensus(results)
+            return synthesis_text, consensus_score
+        return None, None
 
-        # 6. Construire la réponse
+    def _build_response(
+        self,
+        request: CouncilRequest,
+        request_id: str,
+        elapsed_ms: float,
+        results: dict[str, ModelResult],
+        synthesis_text: str | None,
+        consensus_score: float | None,
+    ) -> CouncilResponse:
         total_cost = sum(r.cost for r in results.values())
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-
         model_responses = {
             name: ModelResponse(
                 model=name,
@@ -234,7 +220,7 @@ class Orchestrator:
             for name, r in results.items()
         }
 
-        response = CouncilResponse(
+        return CouncilResponse(
             synthesis=synthesis_text,
             responses=model_responses,
             consensus_score=consensus_score,
@@ -245,15 +231,13 @@ class Orchestrator:
             request_id=request_id,
         )
 
-        # 7. Mettre en cache
-        await self._cache.set(
-            request.question,
-            model_names,
-            request.mode.value,
-            response.model_dump(),
-        )
-
-        # 8. Mettre à jour les stats
+    def _update_stats(
+        self,
+        active_models: list[str],
+        request: CouncilRequest,
+        elapsed_ms: float,
+        total_cost: float,
+    ) -> None:
         self._total_requests += 1
         self._total_cost += total_cost
         self._total_latency_ms += elapsed_ms
@@ -263,6 +247,99 @@ class Orchestrator:
             )
         self._requests_by_mode[request.mode.value] = (
             self._requests_by_mode.get(request.mode.value, 0) + 1
+        )
+
+    async def ask(self, request: CouncilRequest) -> CouncilResponse:
+        """Traite une requête du conseil.
+
+        1. Vérifie le cache
+        2. Optimise les prompts
+        3. Interroge les modèles en parallèle
+        4. Synthétise les réponses
+        5. Met en cache le résultat
+
+        Args:
+            request: La requête du conseil.
+
+        Returns:
+            La réponse complète du conseil.
+        """
+        request_id = str(uuid.uuid4())[:8]
+        start_time = time.perf_counter()
+
+        self._log_request(request_id, request)
+
+        model_names = [m.value for m in request.models]
+
+        # 1. Vérifier le cache
+        cached_response = await self._get_cached_response(
+            request_id, request, model_names
+        )
+        if cached_response:
+            return cached_response
+
+        # 2. Filtrer les modèles configurés
+        active_models = self._get_active_models(model_names)
+
+        if not active_models:
+            logger.error(
+                "Aucun modèle configuré parmi %s [%s]",
+                model_names,
+                request_id,
+            )
+            return CouncilResponse(
+                synthesis="Erreur: aucun modèle configuré. Vérifiez vos clés API.",
+                request_id=request_id,
+                mode=request.mode,
+            )
+
+        logger.info(
+            "Modèles actifs pour cette requête [%s]: %s",
+            request_id,
+            active_models,
+        )
+
+        # 3. Optimiser les prompts
+        prompts = self._build_prompts(request, active_models)
+
+        # 4. Interroger en parallèle
+        logger.debug(
+            "Lancement des appels parallèles [%s]",
+            request_id,
+        )
+
+        results = await self._run_models(request_id, prompts, request)
+
+        # 5. Synthétiser
+        synthesis_text, consensus_score = await self._build_synthesis(
+            request, results
+        )
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        response = self._build_response(
+            request,
+            request_id,
+            elapsed_ms,
+            results,
+            synthesis_text,
+            consensus_score,
+        )
+        total_cost = response.total_cost
+
+        # 7. Mettre en cache
+        await self._cache.set(
+            request.question,
+            model_names,
+            request.mode.value,
+            response.model_dump(),
+        )
+
+        # 8. Mettre à jour les stats
+        self._update_stats(
+            active_models=active_models,
+            request=request,
+            elapsed_ms=elapsed_ms,
+            total_cost=total_cost,
         )
 
         logger.info(

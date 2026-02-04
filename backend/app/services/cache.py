@@ -60,7 +60,11 @@ class CacheService:
     def _make_key(question: str, models: list[str], mode: str) -> str:
         """Génère une clé de cache déterministe."""
         payload = json.dumps(
-            {"question": question.strip().lower(), "models": sorted(models), "mode": mode},
+            {
+                "question": question.strip().lower(),
+                "models": sorted(models),
+                "mode": mode,
+            },
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode()).hexdigest()
